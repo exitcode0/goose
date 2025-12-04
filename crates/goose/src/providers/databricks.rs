@@ -8,6 +8,7 @@ use std::io;
 use std::time::Duration;
 use tokio::pin;
 use tokio_util::io::StreamReader;
+use url::Url;
 
 use super::api_client::{ApiClient, AuthMethod, AuthProvider};
 use super::base::{ConfigKey, MessageStream, Provider, ProviderMetadata, ProviderUsage, Usage};
@@ -212,6 +213,26 @@ impl DatabricksProvider {
 
         provider.model = model_with_fast;
         Ok(provider)
+    }
+
+    /// Strip any path from a URL, returning just the scheme and host with trailing slash.
+    ///
+    /// Examples:
+    /// - `https://example.com/saml/auth` -> `https://example.com/`
+    /// - `https://example.com/` -> `https://example.com/`
+    /// - `https://example.com` -> `https://example.com/`
+    fn strip_path_from_url(url: &str) -> String {
+        match Url::parse(url) {
+            Ok(parsed) => {
+                if let Some(host) = parsed.host_str() {
+                    let port_str = parsed.port().map(|p| format!(":{}", p)).unwrap_or_default();
+                    format!("{}://{}{}/", parsed.scheme(), host, port_str)
+                } else {
+                    url.to_string()
+                }
+            }
+            Err(_) => url.to_string(),
+        }
     }
 
     fn load_retry_config(config: &crate::config::Config) -> RetryConfig {
@@ -542,5 +563,43 @@ impl EmbeddingCapable for DatabricksProvider {
             .collect::<Result<Vec<Vec<f32>>>>()?;
 
         Ok(embeddings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_path_from_url() {
+        // Test URL with path
+        assert_eq!(
+            DatabricksProvider::strip_path_from_url("https://example.com/saml/auth"),
+            "https://example.com/"
+        );
+
+        // Test URL with trailing slash
+        assert_eq!(
+            DatabricksProvider::strip_path_from_url("https://example.com/"),
+            "https://example.com/"
+        );
+
+        // Test URL without trailing slash
+        assert_eq!(
+            DatabricksProvider::strip_path_from_url("https://example.com"),
+            "https://example.com/"
+        );
+
+        // Test URL with port
+        assert_eq!(
+            DatabricksProvider::strip_path_from_url("https://example.com:8443/path"),
+            "https://example.com:8443/"
+        );
+
+        // Test URL with port and no path
+        assert_eq!(
+            DatabricksProvider::strip_path_from_url("https://example.com:8443"),
+            "https://example.com:8443/"
+        );
     }
 }
