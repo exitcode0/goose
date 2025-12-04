@@ -87,11 +87,18 @@ impl TokenCache {
     }
 }
 
-async fn get_workspace_endpoints(host: &str) -> Result<OidcEndpoints> {
-    let base_url = Url::parse(host).expect("Invalid host URL");
-    let oidc_url = base_url
-        .join("oidc/.well-known/oauth-authorization-server")
-        .expect("Invalid OIDC URL");
+async fn get_workspace_endpoints(
+    host: &str,
+    custom_auth_url: Option<&str>,
+    custom_well_known_url: Option<&str>,
+    custom_token_endpoint: Option<&str>,
+) -> Result<OidcEndpoints> {
+    let oidc_url = if let Some(well_known) = custom_well_known_url {
+        Url::parse(well_known)?
+    } else {
+        let base_url = Url::parse(host)?;
+        base_url.join("oidc/.well-known/oauth-authorization-server")?
+    };
 
     let client = reqwest::Client::new();
     let resp = client.get(oidc_url.clone()).send().await?;
@@ -105,17 +112,27 @@ async fn get_workspace_endpoints(host: &str) -> Result<OidcEndpoints> {
 
     let oidc_config: Value = resp.json().await?;
 
-    let authorization_endpoint = oidc_config
-        .get("authorization_endpoint")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("authorization_endpoint not found in OIDC configuration"))?
-        .to_string();
+    let authorization_endpoint = if let Some(auth_url) = custom_auth_url {
+        auth_url.to_string()
+    } else {
+        oidc_config
+            .get("authorization_endpoint")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("authorization_endpoint not found in OIDC configuration")
+            })?
+            .to_string()
+    };
 
-    let token_endpoint = oidc_config
-        .get("token_endpoint")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("token_endpoint not found in OIDC configuration"))?
-        .to_string();
+    let token_endpoint = if let Some(token_url) = custom_token_endpoint {
+        token_url.to_string()
+    } else {
+        oidc_config
+            .get("token_endpoint")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("token_endpoint not found in OIDC configuration"))?
+            .to_string()
+    };
 
     Ok(OidcEndpoints {
         authorization_endpoint,
@@ -376,6 +393,9 @@ pub(crate) async fn get_oauth_token_async(
     client_id: &str,
     redirect_url: &str,
     scopes: &[String],
+    custom_auth_url: Option<&str>,
+    custom_well_known_url: Option<&str>,
+    custom_token_endpoint: Option<&str>,
 ) -> Result<String> {
     // Acquire the global mutex to ensure only one OAuth flow runs at a time
     let _guard = OAUTH_MUTEX.lock().await;
@@ -402,7 +422,14 @@ pub(crate) async fn get_oauth_token_async(
         // Token is expired or has no expiration, try to refresh if we have a refresh token
         if let Some(refresh_token) = token.refresh_token {
             // Get endpoints for token refresh
-            match get_workspace_endpoints(host).await {
+            match get_workspace_endpoints(
+                host,
+                custom_auth_url,
+                custom_well_known_url,
+                custom_token_endpoint,
+            )
+            .await
+            {
                 Ok(endpoints) => {
                     let flow = OAuthFlow::new(
                         endpoints,
@@ -441,7 +468,13 @@ pub(crate) async fn get_oauth_token_async(
     }
 
     // Get endpoints and execute flow for a new token
-    let endpoints = get_workspace_endpoints(host).await?;
+    let endpoints = get_workspace_endpoints(
+        host,
+        custom_auth_url,
+        custom_well_known_url,
+        custom_token_endpoint,
+    )
+    .await?;
     let flow = OAuthFlow::new(
         endpoints,
         client_id.to_string(),
@@ -480,7 +513,66 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let endpoints = get_workspace_endpoints(&mock_server.uri()).await?;
+        let endpoints = get_workspace_endpoints(&mock_server.uri(), None, None, None).await?;
+
+        assert_eq!(
+            endpoints.authorization_endpoint,
+            "https://example.com/oauth2/authorize"
+        );
+        assert_eq!(endpoints.token_endpoint, "https://example.com/oauth2/token");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_workspace_endpoints_with_custom_auth_url() -> Result<()> {
+        let mock_server = MockServer::start().await;
+
+        let mock_response = serde_json::json!({
+            "authorization_endpoint": "https://example.com/oauth2/authorize",
+            "token_endpoint": "https://example.com/oauth2/token"
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/oidc/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&mock_response))
+            .mount(&mock_server)
+            .await;
+
+        let custom_auth_url = "https://example.com/saml/auth";
+        let endpoints =
+            get_workspace_endpoints(&mock_server.uri(), Some(custom_auth_url), None, None).await?;
+
+        // Should use custom auth URL instead of the one from OIDC config
+        assert_eq!(endpoints.authorization_endpoint, custom_auth_url);
+        assert_eq!(endpoints.token_endpoint, "https://example.com/oauth2/token");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_workspace_endpoints_with_custom_well_known_url() -> Result<()> {
+        let mock_server = MockServer::start().await;
+
+        let mock_response = serde_json::json!({
+            "authorization_endpoint": "https://example.com/oauth2/authorize",
+            "token_endpoint": "https://example.com/oauth2/token"
+        });
+
+        // Custom well-known endpoint path
+        Mock::given(method("GET"))
+            .and(path("/custom/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&mock_response))
+            .mount(&mock_server)
+            .await;
+
+        let custom_well_known = format!(
+            "{}/custom/.well-known/openid-configuration",
+            mock_server.uri()
+        );
+        let endpoints =
+            get_workspace_endpoints(&mock_server.uri(), None, Some(&custom_well_known), None)
+                .await?;
 
         assert_eq!(
             endpoints.authorization_endpoint,

@@ -59,16 +59,27 @@ pub enum DatabricksAuth {
         client_id: String,
         redirect_url: String,
         scopes: Vec<String>,
+        auth_url: Option<String>,
+        well_known_url: Option<String>,
+        token_endpoint: Option<String>,
     },
 }
 
 impl DatabricksAuth {
-    pub fn oauth(host: String) -> Self {
+    pub fn oauth(
+        host: String,
+        auth_url: Option<String>,
+        well_known_url: Option<String>,
+        token_endpoint: Option<String>,
+    ) -> Self {
         Self::OAuth {
             host,
             client_id: DEFAULT_CLIENT_ID.to_string(),
             redirect_url: DEFAULT_REDIRECT_URL.to_string(),
             scopes: DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect(),
+            auth_url,
+            well_known_url,
+            token_endpoint,
         }
     }
 
@@ -91,7 +102,21 @@ impl AuthProvider for DatabricksAuthProvider {
                 client_id,
                 redirect_url,
                 scopes,
-            } => oauth::get_oauth_token_async(host, client_id, redirect_url, scopes).await?,
+                auth_url,
+                well_known_url,
+                token_endpoint,
+            } => {
+                oauth::get_oauth_token_async(
+                    host,
+                    client_id,
+                    redirect_url,
+                    scopes,
+                    auth_url.as_deref(),
+                    well_known_url.as_deref(),
+                    token_endpoint.as_deref(),
+                )
+                .await?
+            }
         };
         Ok(("Authorization".to_string(), format!("Bearer {}", token)))
     }
@@ -127,19 +152,33 @@ impl DatabricksProvider {
         }
 
         let host = host?;
+
+        // OAuth endpoint overrides for custom authentication flows (e.g., SAML)
+        let auth_url = config.get_param::<String>("DATABRICKS_AUTH_URL").ok();
+        let well_known_url = config.get_param::<String>("DATABRICKS_WELL_KNOWN").ok();
+        let token_endpoint = config.get_param::<String>("DATABRICKS_TOKEN_ENDPOINT").ok();
+
+        // API host override - allows separating OAuth host from API host
+        let api_host = config
+            .get_param::<String>("DATABRICKS_API_HOST")
+            .unwrap_or_else(|_| host.clone());
+
         let retry_config = Self::load_retry_config(config);
 
         let auth = if let Ok(api_key) = config.get_secret("DATABRICKS_TOKEN") {
             DatabricksAuth::token(api_key)
         } else {
-            DatabricksAuth::oauth(host.clone())
+            DatabricksAuth::oauth(host.clone(), auth_url, well_known_url, token_endpoint)
         };
 
         let auth_method =
             AuthMethod::Custom(Box::new(DatabricksAuthProvider { auth: auth.clone() }));
 
-        let api_client =
-            ApiClient::with_timeout(host, auth_method, Duration::from_secs(DEFAULT_TIMEOUT_SECS))?;
+        let api_client = ApiClient::with_timeout(
+            api_host,
+            auth_method,
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        )?;
 
         // Create the provider without the fast model first
         let mut provider = Self {
@@ -254,8 +293,42 @@ impl Provider for DatabricksProvider {
             DATABRICKS_KNOWN_MODELS.to_vec(),
             DATABRICKS_DOC_URL,
             vec![
-                ConfigKey::new("DATABRICKS_HOST", true, false, None),
-                ConfigKey::new("DATABRICKS_TOKEN", false, true, None),
+                ConfigKey::new(
+                    "DATABRICKS_HOST",
+                    true,
+                    false,
+                    Some("Databricks workspace URL (used for OAuth authentication)"),
+                ),
+                ConfigKey::new(
+                    "DATABRICKS_TOKEN",
+                    false,
+                    true,
+                    Some("Personal access token for authentication (alternative to OAuth)"),
+                ),
+                ConfigKey::new(
+                    "DATABRICKS_API_HOST",
+                    false,
+                    false,
+                    Some("Optional separate host for API calls (defaults to DATABRICKS_HOST)"),
+                ),
+                ConfigKey::new(
+                    "DATABRICKS_AUTH_URL",
+                    false,
+                    false,
+                    Some("Optional custom authorization URL (e.g., for SAML authentication)"),
+                ),
+                ConfigKey::new(
+                    "DATABRICKS_WELL_KNOWN",
+                    false,
+                    false,
+                    Some("Optional custom OIDC discovery URL"),
+                ),
+                ConfigKey::new(
+                    "DATABRICKS_TOKEN_ENDPOINT",
+                    false,
+                    false,
+                    Some("Optional custom OAuth token endpoint URL"),
+                ),
             ],
         )
     }

@@ -317,6 +317,9 @@ impl ApiClient {
             &config.client_id,
             &config.redirect_url,
             &config.scopes,
+            None,
+            None,
+            None,
         )
         .await
     }
